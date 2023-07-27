@@ -56,34 +56,36 @@ func median(times []time.Duration) time.Duration {
 	return times[len(times)/2]
 }
 
-func worker(id int, start *sync.Cond, done chan<- Result, dbName, username, password, host, query string, earlyConnect bool) {
-	start.L.Lock()
-	start.Wait()
-	start.L.Unlock()
-
+func worker(id int, start *sync.WaitGroup, done chan<- Result, dbName, username, password, host, query string, earlyConnect bool) {
 	var (
 		conn        *sql.DB
 		connectTime time.Duration
 		err         error
+		result      = Result{Failed: true}
 	)
+	defer func(id int, result *Result) {
+		logrus.Debugf("Thread %d: Returning result", id)
+		done <- *result
+	}(id, &result) // Always send a result when the goroutine exits
 
 	if earlyConnect {
-		conn, connectTime, err = connect(dbName, username, password, host)
+		conn, connectTime, err = connect(id, dbName, username, password, host)
 		if err != nil {
 			logrus.Errorf("Thread %d: %v", id, err)
-			done <- Result{Failed: true}
 			return
 		}
 		defer conn.Close()
+		start.Wait()
 	}
 
+	logrus.Debugf("Thread %d: ready", id)
+	start.Wait()
 	startTime := time.Now()
 
 	if !earlyConnect {
-		conn, connectTime, err = connect(dbName, username, password, host)
+		conn, connectTime, err = connect(id, dbName, username, password, host)
 		if err != nil {
 			logrus.Errorf("Thread %d: %v", id, err)
-			done <- Result{Failed: true}
 			return
 		}
 		defer conn.Close()
@@ -94,24 +96,26 @@ func worker(id int, start *sync.Cond, done chan<- Result, dbName, username, pass
 	rows, err := conn.Query(query)
 	if err != nil {
 		logrus.Errorf("Thread %d: %v", id, err)
-		done <- Result{Failed: true}
 		return
 	}
 
 	queryTime := time.Since(startTime)
 	startTime = time.Now()
 
+	logrus.Debugf("Thread %d: Fetching SQL data", id)
 	rows.Next()
 	_ = rows.Close()
-	logrus.Debugf("Thread %d: Fetching result", id)
 	fetchTime := time.Since(startTime)
-
-	done <- Result{TotalTime: connectTime + queryTime + fetchTime, ConnectTime: connectTime, QueryTime: queryTime, FetchTime: fetchTime}
+	result.TotalTime = connectTime + queryTime + fetchTime
+	result.ConnectTime = connectTime
+	result.QueryTime = queryTime
+	result.FetchTime = fetchTime
+	result.Failed = false
 }
 
-func connect(dbName, username, password, host string) (*sql.DB, time.Duration, error) {
+func connect(id int, dbName, username, password, host string) (*sql.DB, time.Duration, error) {
 	start := time.Now()
-	logrus.Debug("Connecting to the database")
+	logrus.Debugf("Thread %d: Connecting to the database", id)
 
 	connStr := fmt.Sprintf("dbname=%s user=%s host=%s sslmode=disable", dbName, username, host)
 	if password != "" {
@@ -169,7 +173,8 @@ func main() {
 		logrus.SetLevel(logrus.InfoLevel)
 	}
 
-	start := sync.NewCond(&sync.Mutex{})
+	start := &sync.WaitGroup{}
+	start.Add(1)
 	done := make(chan Result, workers)
 
 	logrus.Info("Preparing workers")
@@ -179,7 +184,7 @@ func main() {
 	}
 
 	logrus.Info("Starting queries")
-	start.Broadcast()
+	start.Done()
 
 	totalTimes := make([]time.Duration, 0, workers)
 	connectTimes := make([]time.Duration, 0, workers)
@@ -187,6 +192,7 @@ func main() {
 	fetchTimes := make([]time.Duration, 0, workers)
 	failed := 0
 
+	logrus.Info("Fetching results")
 	for i := 0; i < workers; i++ {
 		result := <-done
 
@@ -202,10 +208,14 @@ func main() {
 	}
 
 	logrus.Info("All queries completed")
+	fmt.Printf("Failed queries: %d\n", failed)
 
-	fmt.Printf("Total times: min=%v, median=%v, avg=%v, max=%v\n", min(totalTimes), median(totalTimes), avg(totalTimes), max(totalTimes))
-	fmt.Printf("Connect times: min=%v, median=%v, avg=%v, max=%v\n", min(connectTimes), median(connectTimes), avg(connectTimes), max(connectTimes))
-	fmt.Printf("Query times: min=%v, median=%v, avg=%v, max=%v\n", min(queryTimes), median(queryTimes), avg(queryTimes), max(queryTimes))
-	fmt.Printf("Fetch times: min=%v, median=%v, avg=%v, max=%v\n", min(fetchTimes), median(fetchTimes), avg(fetchTimes), max(fetchTimes))
-	fmt.Printf("Failed: %d\n", failed)
+	if len(totalTimes) > 0 {
+		fmt.Printf("Total times: min=%v, median=%v, avg=%v, max=%v\n", min(totalTimes), median(totalTimes), avg(totalTimes), max(totalTimes))
+		fmt.Printf("Connect times: min=%v, median=%v, avg=%v, max=%v\n", min(connectTimes), median(connectTimes), avg(connectTimes), max(connectTimes))
+		fmt.Printf("Query times: min=%v, median=%v, avg=%v, max=%v\n", min(queryTimes), median(queryTimes), avg(queryTimes), max(queryTimes))
+		fmt.Printf("Fetch times: min=%v, median=%v, avg=%v, max=%v\n", min(fetchTimes), median(fetchTimes), avg(fetchTimes), max(fetchTimes))
+	} else {
+		fmt.Printf("No successful queries to calculate statistics.\n")
+	}
 }
